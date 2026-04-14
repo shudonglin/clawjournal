@@ -74,3 +74,5 @@ Optional self-hosted path:
 - `clawjournal share` can upload to an ingest backend only when `CLAWJOURNAL_INGEST_URL` is explicitly configured.
 
 The default configuration is local-first and does not require any hosted backend.
+
+See [PRIVACY.md](PRIVACY.md) for the full redaction and upload model.
