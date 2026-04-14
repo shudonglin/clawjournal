@@ -25,9 +25,9 @@ Preferred path:
 
 - Reproduce with synthetic data whenever possible.
 - Redact all secrets, tokens, emails, usernames, and local paths before sharing logs.
-- If the issue affects exported bundles, describe whether it impacts local export, hosted/self-hosted share flows, or both.
+- If the issue affects exported bundles, describe whether it impacts local export, the optional upload flow, or both.
 
 ## Non-Goals
 
 - Support questions and feature requests are not security reports.
-- Findings that require a deliberately self-hosted ingest deployment should clearly state that assumption.
+- Findings that require a user-configured ingest deployment should clearly state that assumption.

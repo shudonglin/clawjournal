@@ -4,65 +4,54 @@ Review and curate your coding agent conversation traces — 100% locally. ClawJo
 
 ## Your data stays local
 
-- **Nothing leaves your machine** unless you explicitly choose to verify or share.
-- **Secrets and PII are auto-redacted** — API keys, tokens, passwords, and personal info are replaced with typed placeholders (e.g. `[REDACTED_ANTHROPIC_KEY]`, `[REDACTED_JWT]`, `[REDACTED_EMAIL]`) before any export.
-- **PII review before sharing** — `clawjournal export --pii-review --pii-apply` adds AI-assisted detection on top of automatic redaction.
-- **Privacy report after every share** — you'll always see exactly what was redacted (e.g., "3 API keys, 2 JWT tokens, 1 database URL redacted"). No silent uploads.
-- **Preview before sharing** — `clawjournal share --preview` shows what sessions would be included. The actual upload sends only the redacted share; your verification email and upload token are handled separately.
-- **You choose what's included** — approve, block, or exclude sessions and projects at every step.
+Everything in the default workflow runs on your own computer:
 
-## What gets anonymized
+- `scan`, `serve`, `inbox`, `search`, `score`, `export`, and `bundle-export` all run locally.
+- The review UI opens on `localhost:8384` in your own browser — no account, no cloud service.
+- `bundle-export` writes redacted files to your disk. It does not upload them.
+- Uploading is a separate, opt-in flow. If you never configure an ingest endpoint and never run a share command, nothing is sent anywhere.
 
-Every export passes through multiple layers of automatic protection:
+## If you decide to share
 
-| What | How it's protected |
-|------|-------------------|
-| File paths | Stripped to project-relative paths. Your home directory and username are removed. |
-| Your username | Replaced with an anonymous hash (e.g., `user_a1b2c3d4`), consistent across exports. |
-| API keys & tokens | Auto-detected and redacted: Anthropic, OpenAI, GitHub, AWS, Slack, Discord, HuggingFace, PyPI, NPM, and more. |
-| Passwords & database URLs | Connection strings and secrets in environment variables are caught and redacted. |
-| Private keys | SSH, RSA, EC, and OpenSSH private keys are detected and removed. |
-| Email addresses | Personal email addresses are replaced with `[REDACTED_EMAIL]`. |
-| Suspicious strings | Long random-looking strings (potential secrets) are flagged using entropy analysis. |
-| Timestamps | Coarsened to hour-level in exports — exact times are not shared. |
-| Custom strings | Add your own company names, domains, or project names to always redact. |
+Sharing is fully opt-in and separate from local review. When you do choose to export or upload, ClawJournal runs automatic redaction first (paths, usernames, emails, API keys, tokens, private keys, and similar) and can layer AI-assisted PII review on top.
 
-Automated redaction catches the vast majority of secrets. For extra protection, add AI-assisted PII detection on top:
-
-```bash
-clawjournal export --pii-review --pii-apply
-# Or with hybrid AI provider:
-clawjournal export --pii-review --pii-provider hybrid
-```
+See [PRIVACY.md](PRIVACY.md) for the full redaction list and the two sharing paths (local file vs. self-configured upload).
 
 ---
 
 ## Quickstart
 
-### Option 1: Universal skills (recommended)
+### Fastest first run (no install)
 
-Works with Claude Code, Codex, Cursor, Gemini CLI, OpenCode, and [many more](https://github.com/nicepkg/skills). The setup wizard handles Python, installation, and configuration automatically.
+The quickest way to try ClawJournal is to let your coding agent do the setup for you. Paste this into any coding agent (Claude Code, Codex, Cursor, etc.):
+
+```
+Set up ClawJournal from https://github.com/kai-rayward/clawjournal in a virtual environment, build the frontend, run `clawjournal scan`, and start `clawjournal serve`.
+Keep everything local unless I explicitly ask to share data.
+```
+
+The agent will clone the repo, set up a venv, build the browser UI, scan your sessions, and open the workbench at `http://localhost:8384`. Nothing leaves your machine.
+
+### Recommended for repeat use (persistent skills)
+
+If you plan to use ClawJournal more than once, install it as a skill. Works with Claude Code, Codex, Cursor, Gemini CLI, OpenCode, and [many more](https://github.com/nicepkg/skills). Requires Node.js for the one-time `npx` command.
 
 ```bash
 npx skills add kai-rayward/clawjournal
 ```
 
-Then inside your agent, say `setup clawjournal`. The three skills added are:
+Then inside your coding agent, say:
+
+```text
+setup clawjournal
+```
+
+The setup skill installs ClawJournal on your machine, scans your local sessions, and launches the workbench in your browser. Nothing is uploaded. It adds:
 - **clawjournal-setup** — interactive wizard to install, scan sessions, and launch the workbench
 - **clawjournal** — review, triage, and share traces
 - **clawjournal-score** — AI-assisted quality scoring
 
-### Option 2: Paste this into any coding agent
-
-No setup required — just paste this prompt into any coding agent:
-
-```
-Help me set up ClawJournal to review my coding agent traces.
-Clone it from GitHub, install it in a virtual environment, build the frontend, scan my sessions, and open the review workbench.
-Everything runs 100% locally — nothing is uploaded without my approval.
-```
-
-### Option 3: Manual setup
+### Manual setup
 
 ClawJournal is currently installed from source. There is no PyPI release yet.
 
@@ -81,8 +70,8 @@ npm install
 npm run build
 cd ../../..
 
-clawjournal scan          # Find all your local sessions
-clawjournal serve         # Open review UI at localhost:8384
+clawjournal scan          # Index local sessions from Claude Code, Codex, etc.
+clawjournal serve         # Open review UI at http://localhost:8384 (your machine only)
 ```
 
 <details>
@@ -142,6 +131,7 @@ ClawJournal can parse session data from: Claude Code, Claude Desktop, Codex, Gem
 
 ### Project docs
 
+- [PRIVACY.md](PRIVACY.md) — what stays local, what gets redacted, and how optional sharing works
 - [ARCHITECTURE.md](ARCHITECTURE.md) — public architecture overview
 - [CONTRIBUTING.md](CONTRIBUTING.md) — contribution guidelines
 - [SECURITY.md](SECURITY.md) — security reporting and threat-model scope
@@ -150,12 +140,12 @@ ClawJournal can parse session data from: Claude Code, Claude Desktop, Codex, Gem
 
 ## Workflow
 
-ClawJournal enforces a step-by-step workflow to prevent accidental data leaks. Steps 2-3 are required before export; the rest are recommended. The entire workflow runs in your terminal — no browser needed (also works on remote VMs over SSH).
+The core local-review flow runs entirely on your machine. Steps 2-3 are required before anything else; Step 4 is where you actually review traces in the workbench.
 
 ```
- Scan ──> Configure ──> Confirm ──> [Triage] ──> [PII Review] ──> Share
-  1           2            3           4              5             6
-           required ──────┘           optional/recommended
+ Scan ──> Configure ──> Confirm ──> Triage
+  1           2            3           4
+           required ──────┘
 ```
 
 ### Step 1 — Scan
@@ -164,7 +154,7 @@ ClawJournal enforces a step-by-step workflow to prevent accidental data leaks. S
 clawjournal scan
 ```
 
-Discovers and indexes sessions. Not gated, but should run first so later steps have data to work with.
+Reads your local session files and indexes them into a SQLite DB in your home directory. Run this first so later steps have data to work with.
 
 ### Step 2 — Configure source (required)
 
@@ -200,38 +190,9 @@ By default, `clawjournal score` uses the current agent's automation CLI. For exa
 
 For Codex specifically, this follows Codex non-interactive mode: `codex exec` reuses saved CLI authentication by default, and for automation the recommended explicit credential is `CODEX_API_KEY`.
 
-### Step 5 — Export with PII redaction (recommended)
+For a visual review experience: `clawjournal serve` opens the workbench on `localhost:8384` on your own machine. `clawjournal serve --remote` prints an SSH tunnel command so you can reach the same local server on a remote VM. Build the frontend once first if you installed from source.
 
-```bash
-clawjournal export --pii-review --pii-apply
-```
-
-Runs AI-assisted PII detection on top of automatic regex-based redaction.
-
-### Step 6 — Share a bundle
-
-```bash
-clawjournal bundle-export <bundle_id> --output ~/clawjournal-share     # Writes sessions.jsonl + manifest.json to disk
-```
-
-`bundle-export` produces a redacted share you can distribute however you like — attach to an email, drop in a Drive folder, open a PR. Your data stays in your hands. The same redaction pipeline that hosted sharing uses runs first: regex secret redaction, entropy scanning, custom strings from your config, then mandatory AI-assisted PII review over every session.
-
-<details>
-<summary><b>Self-hosted ingest (advanced)</b></summary>
-
-The `clawjournal share` command can upload shares to an HTTP ingest backend. This is disabled by default — hosted sharing is opt-in. If you deploy your own ingest service (e.g. a Cloud Function), point the client at it:
-
-```bash
-export CLAWJOURNAL_INGEST_URL="https://your-ingest-endpoint.example.com"
-clawjournal verify-email you@university.edu
-clawjournal verify-email you@university.edu --code 123456
-clawjournal share --status approved --note "week 12"
-```
-
-The `.edu` email is used only for verification and audit logging — never included in the shared data.
-</details>
-
-For a visual review experience: `clawjournal serve` (local) or `clawjournal serve --remote` (prints SSH tunnel command for remote VMs). Build the frontend once first if you installed from source.
+If you later decide to export or share traces, see [PRIVACY.md](PRIVACY.md) and the `export`, `bundle-*`, and `share` commands in the reference below.
 
 ---
 
@@ -249,9 +210,8 @@ For a visual review experience: `clawjournal serve` (local) or `clawjournal serv
 | `clawjournal config --source all` | Select source scope — `claude`, `codex`, `gemini`, `opencode`, `openclaw`, `kimi`, `custom`, or `all` (required) |
 | `clawjournal config --confirm-projects` | Confirm project selection (required before export) |
 | `clawjournal score --batch --auto-triage` | AI-score sessions with the current agent's automation CLI, auto-approve 4-5 and block 1-2 |
-| `clawjournal export --pii-review --pii-apply` | Export with PII redaction (recommended before sharing) |
-| `clawjournal verify-email you@university.edu` | Verify a `.edu` email for a single-upload 1-hour window |
-| `clawjournal share --status approved` | Bundle + share (shows privacy report) |
+| `clawjournal export --pii-review --pii-apply` | Export with PII redaction (recommended before any sharing) |
+| `clawjournal bundle-export <bundle_id>` | Export a redacted bundle to disk as `sessions.jsonl` + `manifest.json` |
 
 ### Quick share
 
@@ -284,7 +244,15 @@ For a visual review experience: `clawjournal serve` (local) or `clawjournal serv
 | `clawjournal bundle-list` | List all bundles |
 | `clawjournal bundle-view <bundle_id>` | View bundle details and sessions |
 | `clawjournal bundle-export <bundle_id>` | Export bundle to disk (JSONL + manifest) |
-| `clawjournal bundle-share <bundle_id>` | Upload bundle to ClawJournal ingest service |
+| `clawjournal bundle-share <bundle_id>` | Upload bundle to an ingest service (optional) |
+
+### Optional upload
+
+| Command | Description |
+|---------|-------------|
+| `clawjournal verify-email you@university.edu` | Verify a `.edu` email for upload authorization |
+| `clawjournal share --preview --status approved` | Preview what would be shared without uploading |
+| `clawjournal share --status approved` | Create a bundle and upload it through the configured ingest service |
 
 ### Export & PII
 
@@ -332,7 +300,7 @@ Each line in the exported JSONL is one session:
   "model": "claude-opus-4-6",
   "git_branch": "main",
   "start_time": "2025-06-15T10:00:00+00:00",
-  "end_time": "2025-06-15T10:30:00+00:00",
+  "end_time": "2025-06-15T10:00:00+00:00",
   "messages": [
     {"role": "user", "content": "Fix the login bug", "timestamp": "..."},
     {
