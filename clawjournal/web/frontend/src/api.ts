@@ -11,6 +11,12 @@ import type {
   AllowlistEntry,
   InsightsData,
   AdvisorData,
+  Finding,
+  FindingEntityGroup,
+  FindingStatus,
+  FindingsAllowlistEntry,
+  HoldHistoryEntry,
+  HoldState,
 } from './types.ts';
 
 const BASE = '/api';
@@ -23,8 +29,32 @@ class ApiError extends Error {
   }
 }
 
+declare global {
+  interface Window {
+    __CLAWJOURNAL_API_TOKEN__?: string;
+  }
+}
+
+function authHeader(): Record<string, string> {
+  // The daemon injects the per-install API token into index.html at
+  // serve time; same-origin fetches pick it up here. No token → no
+  // header → 401 (expected on non-daemon-hosted dev setups).
+  const token = typeof window !== 'undefined' ? window.__CLAWJOURNAL_API_TOKEN__ : '';
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, init);
+  const headers: Record<string, string> = { ...authHeader() };
+  if (init?.headers) {
+    const extra = init.headers as Record<string, string>;
+    for (const key of Object.keys(extra)) {
+      headers[key] = extra[key];
+    }
+  }
+  const res = await fetch(`${BASE}${path}`, { ...init, headers });
+  if (res.status === 204) {
+    return undefined as T;
+  }
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
     throw new ApiError(res.status, body.error || `HTTP ${res.status}`);
@@ -70,12 +100,27 @@ export const api = {
       return request(`/sessions/${encodeURIComponent(id)}/redaction-report${q}`);
     },
 
-    update(id: string, body: { status?: string; notes?: string; reason?: string; ai_quality_score?: number; ai_score_reason?: string }): Promise<{ ok: boolean }> {
+    update(id: string, body: { status?: string; notes?: string; reason?: string; ai_quality_score?: number; ai_score_reason?: string; hold_state?: HoldState; embargo_until?: string | null }): Promise<{ ok: boolean }> {
       return request(`/sessions/${encodeURIComponent(id)}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       });
+    },
+
+    findings(id: string, opts: { groupBy?: 'entity'; status?: FindingStatus } = {}): Promise<{ total: number; entities?: FindingEntityGroup[]; findings?: Finding[] }> {
+      const params: Record<string, string> = {};
+      if (opts.groupBy) params.group_by = opts.groupBy;
+      if (opts.status) params.status = opts.status;
+      return request(`/sessions/${encodeURIComponent(id)}/findings${qs(params)}`);
+    },
+
+    holdHistory(id: string): Promise<{ total: number; history: HoldHistoryEntry[] }> {
+      return request(`/sessions/${encodeURIComponent(id)}/hold-history`);
+    },
+
+    forceScan(id: string): Promise<{ status: string; revision?: string; count?: number }> {
+      return request(`/sessions/${encodeURIComponent(id)}/scan`, { method: 'POST' });
     },
 
     score(id: string, body?: { backend?: string; model?: string }): Promise<{
@@ -110,8 +155,9 @@ export const api = {
     return request('/projects');
   },
 
-  shareReady(): Promise<{ count: number; total_approved: number; projects: string[]; models: string[]; recommended_session_ids: string[]; sessions: Array<{ session_id: string; project: string; model: string | null; source: string; display_title: string; ai_quality_score: number | null; user_messages: number; assistant_messages: number; tool_uses: number; input_tokens: number; outcome_badge: string | null; client_origin: string | null; runtime_channel: string | null; start_time: string | null }> }> {
-    return request('/share-ready');
+  shareReady(opts?: { includeUnapproved?: boolean }): Promise<{ count: number; total_approved: number; projects: string[]; models: string[]; recommended_session_ids: string[]; sessions: Array<{ session_id: string; project: string; model: string | null; source: string; display_title: string; ai_quality_score: number | null; user_messages: number; assistant_messages: number; tool_uses: number; input_tokens: number; outcome_badge: string | null; client_origin: string | null; runtime_channel: string | null; start_time: string | null; review_status?: string }> }> {
+    const q = opts?.includeUnapproved ? '?include_unapproved=1' : '';
+    return request(`/share-ready${q}`);
   },
 
   quickShare(sessionIds: string[], note?: string): Promise<{
@@ -163,8 +209,29 @@ export const api = {
       return `${BASE}/shares/${encodeURIComponent(id)}/download`;
     },
 
-    download(id: string): void {
-      window.open(`${BASE}/shares/${encodeURIComponent(id)}/download`, '_blank');
+    async download(id: string): Promise<void> {
+      // `window.open` can't attach the Bearer auth header the daemon
+      // requires, so fetch the zip through the same auth'd path as every
+      // other API call and hand the browser a blob URL to save.
+      const res = await fetch(`${BASE}/shares/${encodeURIComponent(id)}/download`, {
+        headers: authHeader(),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new ApiError(res.status, body.error || `HTTP ${res.status}`);
+      }
+      const disposition = res.headers.get('Content-Disposition') || '';
+      const match = /filename="?([^";]+)"?/.exec(disposition);
+      const filename = match ? match[1] : `share-${id}.zip`;
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
     },
 
     upload(id: string, force?: boolean): Promise<{
@@ -224,7 +291,45 @@ export const api = {
     return request(`/advisor${qs(params)}`);
   },
 
-  scan(): Promise<{ ok: boolean; new_sessions: Record<string, number> }> {
-    return request('/scan', { method: 'POST' });
+  scan(opts: { force?: boolean } = {}): Promise<{ ok: boolean; new_sessions: Record<string, number>; force_rescan?: { processed: number; errored: { session_id: string; error: string }[] } }> {
+    const path = opts.force ? '/scan?force=true' : '/scan';
+    return request(path, { method: 'POST' });
+  },
+
+  findings: {
+    patch(findingIds: string[], status: 'accepted' | 'ignored', opts: { reason?: string; global?: boolean } = {}): Promise<{ updated: number; allowlisted: boolean }> {
+      return request('/findings', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          finding_ids: findingIds,
+          status,
+          reason: opts.reason,
+          global: opts.global,
+        }),
+      });
+    },
+
+    allowlist: {
+      list(): Promise<{ total: number; entries: FindingsAllowlistEntry[] }> {
+        return request('/findings/allowlist');
+      },
+
+      add(body: { entity_text: string; entity_type?: string | null; entity_label?: string | null; reason?: string | null }): Promise<{
+        entry: FindingsAllowlistEntry;
+        retroactive_updates: number;
+        retroactive_sessions: number;
+      }> {
+        return request('/findings/allowlist', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+      },
+
+      remove(id: string): Promise<{ removed: boolean; reverted: number; reassigned: number }> {
+        return request(`/findings/allowlist/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      },
+    },
   },
 };
