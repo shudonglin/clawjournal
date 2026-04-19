@@ -273,6 +273,7 @@ export function Dashboard() {
         ))}
       </div>
 
+
       {/* Outcomes + Agent Behavior — promoted for visibility */}
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 12 }}>
         {/* Outcomes distribution */}

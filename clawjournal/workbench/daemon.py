@@ -39,6 +39,7 @@ from .index import (
     get_share,
     get_shares,
     get_dashboard_analytics,
+    get_highlights,
     get_policies,
     get_session_detail,
     get_share_ready_stats,
@@ -106,6 +107,32 @@ def _persist_scoring_result(conn: sqlite3.Connection, session_id: str, result: A
         ai_effort_estimate=result.effort_estimate,
         ai_summary=result.summary or None,
     )
+
+
+def _maybe_create_trace_note(conn: sqlite3.Connection, session_id: str) -> None:
+    """Create `notes/{session_id}.md` if it does not already exist.
+
+    Called from both score paths (auto-scoring in `score_unscored_once` and
+    manual scoring in `_handle_score_session`) after the DB is updated, so
+    the freshly-written `ai_summary` is what lands in the file. Strictly
+    create-if-missing — never overwrite existing notes in the scoring hook,
+    because they may carry unsynced user edits.
+
+    Errors are logged but never raised: note creation is a best-effort
+    side effect of scoring, not a requirement for scoring to succeed.
+    """
+    try:
+        from ..workbench.trace_note import create_note_if_missing
+        row = conn.execute(
+            "SELECT * FROM sessions WHERE session_id = ?", (session_id,)
+        ).fetchone()
+        if row is None:
+            return
+        created = create_note_if_missing(dict(row))
+        if created is not None:
+            logger.debug("created trace note at %s", created)
+    except Exception:
+        logger.exception("Failed to create trace note for %s", session_id)
 
 
 class Scanner:
@@ -225,6 +252,7 @@ class Scanner:
 
                     if _persist_scoring_result(conn, sid, result):
                         scored += 1
+                        _maybe_create_trace_note(conn, sid)
 
                 return scored
             finally:
@@ -839,6 +867,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             self._handle_stats(params)
         elif path == "/api/dashboard":
             self._handle_dashboard(params)
+        elif path == "/api/dashboard/highlights":
+            self._handle_highlights(params)
         elif path == "/api/insights":
             self._handle_insights(params)
         elif path == "/api/advisor":
@@ -1233,6 +1263,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 _json_response(self, {"error": "Session not found"}, 404)
                 return
 
+            _maybe_create_trace_note(conn, session_id)
+
             _json_response(self, {
                 "ok": True,
                 "ai_quality_score": result.quality,
@@ -1277,6 +1309,28 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         conn = open_index()
         try:
             data = get_dashboard_analytics(conn, start=start, end=end)
+            _json_response(self, data)
+        finally:
+            conn.close()
+
+    def _handle_highlights(self, params: dict[str, list[str]]) -> None:
+        def _int_param(name: str, default: int, lo: int, hi: int) -> int:
+            raw = params.get(name, [str(default)])[0]
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                return default
+            return max(lo, min(hi, value))
+
+        days = _int_param("days", 7, 1, 90)
+        top_n = _int_param("top", 3, 1, 12)
+        min_quality = _int_param("min_quality", 4, 1, 5)
+
+        conn = open_index()
+        try:
+            data = get_highlights(
+                conn, days=days, top_n=top_n, min_quality=min_quality
+            )
             _json_response(self, data)
         finally:
             conn.close()
