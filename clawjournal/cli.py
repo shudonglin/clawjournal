@@ -3220,6 +3220,26 @@ def main() -> None:
              "(default: 1024 in human mode, no truncation in --json mode)",
     )
 
+    events_cost = events_sub.add_parser(
+        "cost",
+        help="Cost ledger commands (token attribution + anomaly detection)",
+    )
+    events_cost_sub = events_cost.add_subparsers(
+        dest="cost_command", required=True
+    )
+    events_cost_ingest = events_cost_sub.add_parser(
+        "ingest",
+        help="Extract token usage from already-recorded events and detect anomalies",
+    )
+    events_cost_ingest.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="Replay the full cost ledger from raw events, bypassing the incremental cursor",
+    )
+    events_cost_ingest.add_argument(
+        "--json", action="store_true", help="Output JSON summary"
+    )
+
     # Workbench commands
     serve_parser = sub.add_parser("serve", help="Start the workbench daemon + web UI")
     serve_parser.add_argument("--port", type=int, default=8384, help="Port (default: 8384)")
@@ -3892,6 +3912,10 @@ def _run_events(args) -> None:
         _run_events_inspect(args)
         return
 
+    if args.events_command == "cost":
+        _run_events_cost(args)
+        return
+
     conn = open_index()
     try:
         summary = ingest_pending(conn, source_filter=args.source)
@@ -3906,6 +3930,32 @@ def _run_events(args) -> None:
         f"Ingested {payload['event_rows']} event rows from "
         f"{payload['files_with_changes']} changed files "
         f"({payload['lines_read']} lines, {payload['sessions_touched']} sessions)."
+    )
+
+
+def _run_events_cost(args) -> None:
+    from .events.cost import ingest_cost_pending
+    from .workbench.index import open_index
+
+    if args.cost_command != "ingest":
+        print(f"Unknown cost command: {args.cost_command}", file=sys.stderr)
+        sys.exit(2)
+
+    conn = open_index()
+    try:
+        summary = ingest_cost_pending(conn, rebuild=args.rebuild)
+    finally:
+        conn.close()
+
+    payload = summary.to_dict()
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    print(
+        f"Cost ledger: scanned {payload['events_scanned']} events, "
+        f"wrote {payload['token_rows_written']} token_usage rows + "
+        f"{payload['anomalies_written']} anomalies "
+        f"across {payload['sessions_touched']} sessions."
     )
 
 
