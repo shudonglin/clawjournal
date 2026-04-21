@@ -1025,6 +1025,361 @@ class TestEventsCLI:
         assert payload["event_rows"] == 1
 
 
+class TestEventsInspectCLI:
+    def _setup_db(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "clawjournal.workbench.index.INDEX_DB", tmp_path / "index.db"
+        )
+        monkeypatch.setattr(
+            "clawjournal.workbench.index.CONFIG_DIR", tmp_path / "config"
+        )
+        monkeypatch.setattr("clawjournal.config.CONFIG_DIR", tmp_path / "config")
+
+    def _ingest_one_user_line(self, tmp_path, monkeypatch, vendor_line_payload=None):
+        """Drive real ingest to populate events + event_sessions from a
+        fabricated vendor JSONL file. Returns the ingested events.id."""
+        from clawjournal.parsing import parser
+
+        monkeypatch.setattr(parser, "PROJECTS_DIR", tmp_path / "claude" / "projects")
+        monkeypatch.setattr(parser, "CODEX_SESSIONS_DIR", tmp_path / "codex" / "sessions")
+        monkeypatch.setattr(
+            parser, "CODEX_ARCHIVED_DIR", tmp_path / "codex" / "archived_sessions"
+        )
+        monkeypatch.setattr(parser, "LOCAL_AGENT_DIR", tmp_path / "local_agent")
+        monkeypatch.setattr(parser, "OPENCLAW_AGENTS_DIR", tmp_path / "openclaw" / "agents")
+
+        session_file = tmp_path / "claude" / "projects" / "demo-proj" / "sess.jsonl"
+        session_file.parent.mkdir(parents=True)
+        payload = vendor_line_payload or {
+            "type": "user",
+            "timestamp": "2026-04-20T10:00:00Z",
+            "message": {"content": "hi"},
+        }
+        session_file.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+        from clawjournal.events import ingest_pending
+        from clawjournal.workbench.index import open_index
+
+        conn = open_index()
+        try:
+            ingest_pending(conn, source_filter="claude")
+            event_id = conn.execute("SELECT id FROM events LIMIT 1").fetchone()[0]
+            session_key = conn.execute(
+                "SELECT session_key FROM event_sessions LIMIT 1"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        return event_id, session_key, session_file
+
+    def _seed_override_case(self, tmp_path, monkeypatch):
+        self._setup_db(tmp_path, monkeypatch)
+
+        vendor_file = tmp_path / "vendor.jsonl"
+        vendor_file.write_text('{"vendor":"line"}\n', encoding="utf-8")
+
+        from clawjournal.events import ensure_view_schema, write_hook_override
+        from clawjournal.events.schema import ensure_schema as ensure_events_schema
+        from clawjournal.workbench.index import open_index
+
+        session_key = "claude:demo-proj:sess-override"
+        conn = open_index()
+        try:
+            ensure_events_schema(conn)
+            ensure_view_schema(conn)
+            session_id = conn.execute(
+                """
+                INSERT INTO event_sessions (session_key, client, status)
+                VALUES (?, ?, ?)
+                """,
+                (session_key, "claude", "active"),
+            ).lastrowid
+            event_id = conn.execute(
+                """
+                INSERT INTO events (
+                    session_id, type, event_key, event_at, ingested_at, source,
+                    source_path, source_offset, seq, client, confidence, lossiness,
+                    raw_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    "tool_call",
+                    "tool_call:override",
+                    "2026-04-20T10:00:00Z",
+                    "2026-04-20T10:00:01Z",
+                    "claude-jsonl",
+                    str(vendor_file),
+                    0,
+                    0,
+                    "claude",
+                    "low",
+                    "none",
+                    '{"base":true}',
+                ),
+            ).lastrowid
+            conn.commit()
+            write_hook_override(
+                conn,
+                session_key=session_key,
+                event_key="tool_call:override",
+                event_type="tool_call",
+                source="hook",
+                confidence="high",
+                lossiness="none",
+                event_at="2026-04-20T10:00:02Z",
+                payload_json='{"override":true}',
+                origin="hook:test:v1",
+            )
+        finally:
+            conn.close()
+
+        return int(event_id), session_key, vendor_file
+
+    def test_inspect_by_event_id_emits_json(self, tmp_path, monkeypatch, capsys):
+        self._setup_db(tmp_path, monkeypatch)
+        event_id, _, _ = self._ingest_one_user_line(tmp_path, monkeypatch)
+
+        with patch.object(
+            sys, "argv", ["clawjournal", "events", "inspect", str(event_id), "--json"]
+        ):
+            main()
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["id"] == event_id
+        assert payload["type"] == "user_message"
+        assert payload["client"] == "claude"
+        assert payload["override"] is None
+        assert payload["raw_ref"][0].endswith("sess.jsonl")
+        assert payload["vendor_line"] is not None
+
+    def test_inspect_by_event_id_prefers_canonical_override_fields(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        event_id, _, _ = self._seed_override_case(tmp_path, monkeypatch)
+
+        with patch.object(
+            sys, "argv", ["clawjournal", "events", "inspect", str(event_id), "--json"]
+        ):
+            main()
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["id"] == event_id
+        assert payload["type"] == "tool_call"
+        assert payload["source"] == "hook"
+        assert payload["confidence"] == "high"
+        assert payload["event_at"] == "2026-04-20T10:00:02Z"
+        assert payload["raw_json"] == '{"base":true}'
+        assert payload["override"]["payload_json"] == '{"override":true}'
+        assert payload["vendor_line"] == '{"vendor":"line"}'
+
+    def test_inspect_missing_vendor_file_falls_back_to_placeholder(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        self._setup_db(tmp_path, monkeypatch)
+        event_id, _, session_file = self._ingest_one_user_line(tmp_path, monkeypatch)
+        session_file.unlink()
+
+        with patch.object(
+            sys, "argv", ["clawjournal", "events", "inspect", str(event_id)]
+        ):
+            main()
+
+        out = capsys.readouterr().out
+        assert "(source file no longer on disk)" in out
+
+    def test_inspect_by_session_and_event_key_hook_only(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """A hook-only event (override with no matching base) must be
+        reachable via --session --event-key and marked hook_only."""
+        self._setup_db(tmp_path, monkeypatch)
+        _, session_key, _ = self._ingest_one_user_line(tmp_path, monkeypatch)
+
+        from clawjournal.events import ensure_view_schema, write_hook_override
+        from clawjournal.workbench.index import open_index
+
+        conn = open_index()
+        try:
+            ensure_view_schema(conn)
+            write_hook_override(
+                conn,
+                session_key=session_key,
+                event_key="tool_call:hook-only",
+                event_type="tool_call",
+                source="hook",
+                confidence="high",
+                lossiness="none",
+                event_at="2026-04-20T10:00:05Z",
+                payload_json='{"hook":true}',
+                origin="hook:test:v1",
+            )
+        finally:
+            conn.close()
+
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "clawjournal", "events", "inspect",
+                "--session", session_key,
+                "--event-key", "tool_call:hook-only",
+                "--json",
+            ],
+        ):
+            main()
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["id"] is None
+        assert payload["hook_only"] is True
+        assert payload["raw_json"] is None
+        assert payload["raw_ref"] is None
+        assert payload["override"]["origin"] == "hook:test:v1"
+
+    def test_inspect_by_session_and_event_key_prefers_canonical_override_fields(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        event_id, session_key, vendor_file = self._seed_override_case(
+            tmp_path, monkeypatch
+        )
+
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "clawjournal", "events", "inspect",
+                "--session", session_key,
+                "--event-key", "tool_call:override",
+                "--json",
+            ],
+        ):
+            main()
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["id"] == event_id
+        assert payload["type"] == "tool_call"
+        assert payload["source"] == "hook"
+        assert payload["confidence"] == "high"
+        assert payload["event_at"] == "2026-04-20T10:00:02Z"
+        assert payload["raw_ref"][0] == str(vendor_file)
+        assert payload["override"]["origin"] == "hook:test:v1"
+
+    def test_inspect_human_output_includes_raw_and_override_payloads(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        event_id, _, _ = self._seed_override_case(tmp_path, monkeypatch)
+
+        with patch.object(
+            sys, "argv", ["clawjournal", "events", "inspect", str(event_id)]
+        ):
+            main()
+
+        out = capsys.readouterr().out
+        assert "raw_json:" in out
+        assert '{"base":true}' in out
+        assert "override payload:" in out
+        assert '{"override":true}' in out
+
+    def test_inspect_rejects_nonexistent_event_id(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        self._setup_db(tmp_path, monkeypatch)
+        self._ingest_one_user_line(tmp_path, monkeypatch)
+
+        with patch.object(
+            sys, "argv", ["clawjournal", "events", "inspect", "999999"]
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+            assert exc_info.value.code == 1
+        err = capsys.readouterr().err
+        assert "event not found" in err
+
+    def test_inspect_requires_id_xor_session_event_key(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        self._setup_db(tmp_path, monkeypatch)
+        with patch.object(sys, "argv", ["clawjournal", "events", "inspect"]):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+            assert exc_info.value.code == 2
+        err = capsys.readouterr().err
+        assert "requires either" in err
+
+    def test_inspect_truncate_flag_shortens_raw_json(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        self._setup_db(tmp_path, monkeypatch)
+        payload = {
+            "type": "user",
+            "timestamp": "2026-04-20T10:00:00Z",
+            "message": {"content": "x" * 2000},
+        }
+        event_id, _, _ = self._ingest_one_user_line(
+            tmp_path, monkeypatch, vendor_line_payload=payload
+        )
+
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "clawjournal", "events", "inspect", str(event_id),
+                "--json", "--truncate", "64",
+            ],
+        ):
+            main()
+
+        out = json.loads(capsys.readouterr().out)
+        assert out["raw_json"].endswith("chars]")
+        assert "truncated at 64" in out["raw_json"]
+
+    def test_inspect_truncate_zero_disables_truncation(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        self._setup_db(tmp_path, monkeypatch)
+        payload = {
+            "type": "user",
+            "timestamp": "2026-04-20T10:00:00Z",
+            "message": {"content": "x" * 3000},
+        }
+        event_id, _, _ = self._ingest_one_user_line(
+            tmp_path, monkeypatch, vendor_line_payload=payload
+        )
+
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "clawjournal", "events", "inspect", str(event_id),
+                "--json", "--truncate", "0",
+            ],
+        ):
+            main()
+
+        out = json.loads(capsys.readouterr().out)
+        assert "truncated at" not in out["raw_json"]
+        assert len(out["raw_json"]) > 2000
+
+    def test_inspect_human_mode_default_truncates(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        self._setup_db(tmp_path, monkeypatch)
+        payload = {
+            "type": "user",
+            "timestamp": "2026-04-20T10:00:00Z",
+            "message": {"content": "x" * 3000},
+        }
+        event_id, _, _ = self._ingest_one_user_line(
+            tmp_path, monkeypatch, vendor_line_payload=payload
+        )
+
+        with patch.object(
+            sys, "argv", ["clawjournal", "events", "inspect", str(event_id)]
+        ):
+            main()
+        out = capsys.readouterr().out
+        assert "truncated at 1024" in out
+
+
 class TestShareHelpers:
     def test_share_preview_json_returns_payload(self):
         payload = _share_preview([{"session_id": "s1", "display_title": "hello", "risk_badges": "[]"}], output_json=True)

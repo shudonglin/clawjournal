@@ -3198,6 +3198,27 @@ def main() -> None:
         "capabilities",
         help="Dump the execution-recorder capability matrix as JSON",
     )
+    events_inspect = events_sub.add_parser(
+        "inspect",
+        help="Inspect a single event, its vendor line, and any override",
+    )
+    events_inspect.add_argument(
+        "event_id",
+        nargs="?",
+        type=int,
+        help="events.id primary key (omit when using --session/--event-key)",
+    )
+    events_inspect.add_argument("--session", help="session_key (with --event-key)")
+    events_inspect.add_argument("--event-key", dest="event_key", help="event_key (with --session)")
+    events_inspect.add_argument("--json", action="store_true", help="Output structured JSON")
+    events_inspect.add_argument(
+        "--truncate",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Truncate raw_json / payload_json / vendor line to N chars "
+             "(default: 1024 in human mode, no truncation in --json mode)",
+    )
 
     # Workbench commands
     serve_parser = sub.add_parser("serve", help="Start the workbench daemon + web UI")
@@ -3867,6 +3888,10 @@ def _run_events(args) -> None:
         print(json.dumps(capabilities_json(), indent=2, sort_keys=True))
         return
 
+    if args.events_command == "inspect":
+        _run_events_inspect(args)
+        return
+
     conn = open_index()
     try:
         summary = ingest_pending(conn, source_filter=args.source)
@@ -3882,6 +3907,300 @@ def _run_events(args) -> None:
         f"{payload['files_with_changes']} changed files "
         f"({payload['lines_read']} lines, {payload['sessions_touched']} sessions)."
     )
+
+
+_INSPECT_HUMAN_DEFAULT_TRUNCATE = 1024
+
+
+def _run_events_inspect(args) -> None:
+    from .events import CAPABILITY_MATRIX, ensure_view_schema
+    from .events.schema import ensure_schema as ensure_events_schema
+    from .workbench.index import open_index
+
+    has_id = args.event_id is not None
+    has_sk_ek = args.session is not None and args.event_key is not None
+    if not (has_id ^ has_sk_ek):
+        print(
+            "inspect requires either <event-id> OR both --session and --event-key",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    conn = open_index()
+    try:
+        ensure_events_schema(conn)
+        ensure_view_schema(conn)
+        if has_id:
+            payload = _inspect_by_event_id(conn, args.event_id)
+        else:
+            payload = _inspect_by_session_event_key(conn, args.session, args.event_key)
+
+        if payload is None:
+            print("event not found", file=sys.stderr)
+            sys.exit(1)
+
+        payload["capability"] = _capability_reason(
+            CAPABILITY_MATRIX, payload["client"], payload["type"]
+        )
+        if payload.get("raw_ref") is not None:
+            source_path, source_offset, _seq = payload["raw_ref"]
+            payload["vendor_line"] = _resolve_vendor_line_text(
+                conn, source_path, source_offset, payload["raw_ref"][2]
+            )
+        else:
+            payload["vendor_line"] = None
+    finally:
+        conn.close()
+
+    _apply_inspect_truncation(payload, _effective_truncate(args))
+
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True, default=str))
+        return
+
+    _print_inspect_human(payload)
+
+
+def _effective_truncate(args) -> int | None:
+    """Return the truncation limit in chars, or None for unlimited.
+
+    - `--truncate 0` means unlimited (explicit opt-out).
+    - `--truncate N` (N>0) always truncates.
+    - No flag: human mode defaults to 1024; --json defaults to unlimited.
+    """
+    if args.truncate is not None:
+        return None if args.truncate <= 0 else args.truncate
+    return None if args.json else _INSPECT_HUMAN_DEFAULT_TRUNCATE
+
+
+def _apply_inspect_truncation(payload: dict, limit: int | None) -> None:
+    if limit is None:
+        return
+    payload["raw_json"] = _truncate_str(payload.get("raw_json"), limit)
+    override = payload.get("override")
+    if override is not None:
+        override["payload_json"] = _truncate_str(override.get("payload_json"), limit)
+    payload["vendor_line"] = _truncate_str(payload.get("vendor_line"), limit)
+
+
+def _truncate_str(value, limit: int):
+    if not isinstance(value, str) or len(value) <= limit:
+        return value
+    return value[:limit] + f" … [truncated at {limit} of {len(value)} chars]"
+
+
+def _inspect_by_event_id(conn, event_id: int):
+    row = conn.execute(
+        """
+        SELECT events.*, event_sessions.session_key, event_sessions.client
+          FROM events
+          JOIN event_sessions ON event_sessions.id = events.session_id
+         WHERE events.id = ?
+        """,
+        (event_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    base = dict(row)
+    override = _load_override(conn, base["session_id"], base["event_key"])
+    return _payload_for_base_and_override(base, override)
+
+
+def _inspect_by_session_event_key(conn, session_key: str, event_key: str):
+    session_row = conn.execute(
+        "SELECT id, session_key, client FROM event_sessions WHERE session_key = ?",
+        (session_key,),
+    ).fetchone()
+    if session_row is None:
+        return None
+    session_id = int(session_row["id"])
+    client = session_row["client"]
+
+    # Prefer base row if one exists for this event_key; otherwise hook-only.
+    base_row = conn.execute(
+        """
+        SELECT *
+          FROM events
+         WHERE session_id = ? AND event_key = ?
+         ORDER BY event_at IS NULL, event_at, source_path, source_offset, seq
+         LIMIT 1
+        """,
+        (session_id, event_key),
+    ).fetchone()
+    override = _load_override(conn, session_id, event_key)
+
+    if base_row is None and override is None:
+        return None
+
+    if base_row is None:
+        # hook-only
+        return {
+            "id": None,
+            "session_id": session_id,
+            "session_key": session_key,
+            "client": client,
+            "type": override["type"],
+            "event_key": override["event_key"],
+            "event_at": override["event_at"],
+            "ingested_at": None,
+            "source": override["source"],
+            "confidence": override["confidence"],
+            "lossiness": override["lossiness"],
+            "raw_json": None,
+            "raw_ref": None,
+            "override": _override_payload(override),
+            "hook_only": True,
+        }
+
+    base = dict(base_row)
+    base["session_key"] = session_key
+    base["client"] = client
+    return _payload_for_base_and_override(base, override)
+
+
+def _load_override(conn, session_id: int, event_key):
+    if event_key is None:
+        return None
+    row = conn.execute(
+        """
+        SELECT event_key, type, source, confidence, lossiness,
+               event_at, payload_json, origin, created_at
+          FROM event_overrides
+         WHERE session_id = ? AND event_key = ?
+        """,
+        (session_id, event_key),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def _override_payload(override: dict) -> dict:
+    return {
+        "source": override["source"],
+        "confidence": override["confidence"],
+        "lossiness": override["lossiness"],
+        "event_at": override["event_at"],
+        "payload_json": override["payload_json"],
+        "origin": override["origin"],
+        "created_at": override["created_at"],
+    }
+
+
+def _payload_for_base_and_override(base: dict, override):
+    override_applied = override is not None and _override_wins_base(base, override)
+    payload = {
+        "id": base["id"],
+        "session_id": base["session_id"],
+        "session_key": base["session_key"],
+        "client": base["client"],
+        "type": override["type"] if override_applied else base["type"],
+        "event_key": base["event_key"],
+        "event_at": override["event_at"] if override_applied else base["event_at"],
+        "ingested_at": base["ingested_at"],
+        "source": override["source"] if override_applied else base["source"],
+        "confidence": override["confidence"] if override_applied else base["confidence"],
+        "lossiness": override["lossiness"] if override_applied else base["lossiness"],
+        "raw_json": base["raw_json"],
+        "raw_ref": [base["source_path"], base["source_offset"], base["seq"]],
+        "override": _override_payload(override) if override is not None else None,
+        "hook_only": False,
+    }
+    return payload
+
+
+def _override_wins_base(base: dict, override: dict) -> bool:
+    from .events import CONFIDENCE_RANK
+
+    return (
+        CONFIDENCE_RANK.get(override["confidence"], 0)
+        >= CONFIDENCE_RANK.get(base["confidence"], 0)
+    )
+
+
+def _capability_reason(matrix, client: str, event_type: str) -> str:
+    supported, reason = matrix.get(
+        (client, event_type), (False, "not emitted by this client")
+    )
+    prefix = "emitted" if supported else "NOT emitted"
+    return f"{prefix} by {client} ({reason})"
+
+
+def _resolve_vendor_line_text(conn, source_path: str, source_offset: int, seq: int):
+    # First try a bundle-imported snippet store if it exists; 07 will
+    # own the table, so tolerate the table being absent today.
+    import sqlite3 as _sqlite3
+    try:
+        row = conn.execute(
+            """
+            SELECT text FROM event_source_snippets
+             WHERE source_path = ? AND source_offset = ? AND seq = ?
+            """,
+            (source_path, source_offset, seq),
+        ).fetchone()
+        if row is not None:
+            return row[0]
+    except _sqlite3.OperationalError:
+        # Table doesn't exist yet (07 owns it); fall through.
+        pass
+    from .events import fetch_vendor_line
+    return fetch_vendor_line(source_path, source_offset)
+
+
+def _print_inspect_human(payload: dict) -> None:
+    ev_id = payload["id"]
+    label = f"#{ev_id}" if ev_id is not None else "(hook-only)"
+    print(f"event {label}  type={payload['type']}  event_key={payload['event_key']}")
+    print(f"session    {payload['session_key']} (client={payload['client']})")
+    print(f"source     {payload['source']}")
+    print(f"confidence {payload['confidence']:<10}          lossiness={payload['lossiness']}")
+    event_at = payload["event_at"] or "(none)"
+    ingested_at = payload["ingested_at"] or "(n/a)"
+    print(f"event_at   {event_at:<24} ingested_at={ingested_at}")
+    raw_ref = payload.get("raw_ref")
+    if raw_ref is None:
+        print("raw_ref    (no vendor base — hook-originated)")
+    else:
+        print(f"raw_ref    {raw_ref[0]}:{raw_ref[1]}:{raw_ref[2]}")
+    print()
+
+    override = payload.get("override")
+    if override is None:
+        print("override   (none)")
+    else:
+        print(
+            f"override   source={override['source']} confidence={override['confidence']} "
+            f"origin={override['origin']}"
+        )
+    print(f"capability {payload['capability']}")
+    print()
+
+    raw_json = payload.get("raw_json")
+    if raw_json is not None:
+        print("raw_json:")
+        _print_indented_text(raw_json)
+        print()
+
+    if override is not None:
+        print("override payload:")
+        _print_indented_text(override["payload_json"])
+        print()
+
+    if payload.get("hook_only"):
+        print("vendor line:")
+        print("  (no vendor base — hook-originated)")
+        return
+
+    print("vendor line:")
+    vendor_line = payload.get("vendor_line")
+    if vendor_line is None:
+        print("  (source file no longer on disk)")
+    else:
+        print(f"  {vendor_line}")
+
+
+def _print_indented_text(text: str) -> None:
+    lines = str(text).splitlines() or [""]
+    for line in lines:
+        print(f"  {line}")
 
 
 def _generate_pii_findings(file_path: Path, output_path: Path, provider: str, min_confidence: float = 0.0, backend: str = "auto") -> dict[str, Any]:
