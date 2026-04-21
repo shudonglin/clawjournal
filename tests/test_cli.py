@@ -1380,6 +1380,40 @@ class TestEventsInspectCLI:
         assert "truncated at 1024" in out
 
 
+class TestEventsCostCLI:
+    def test_ingest_rebuild_forwards_flag(self, monkeypatch, capsys):
+        summary = MagicMock()
+        summary.to_dict.return_value = {
+            "events_scanned": 3,
+            "token_rows_written": 1,
+            "anomalies_written": 0,
+            "sessions_touched": 1,
+        }
+        captured: dict[str, object] = {}
+
+        def fake_ingest(conn, *, rebuild=False):
+            captured["conn"] = conn
+            captured["rebuild"] = rebuild
+            return summary
+
+        conn = MagicMock()
+        monkeypatch.setattr("clawjournal.events.cost.ingest_cost_pending", fake_ingest)
+        monkeypatch.setattr("clawjournal.workbench.index.open_index", lambda: conn)
+
+        with patch.object(
+            sys,
+            "argv",
+            ["clawjournal", "events", "cost", "ingest", "--rebuild", "--json"],
+        ):
+            main()
+
+        assert captured["conn"] is conn
+        assert captured["rebuild"] is True
+        conn.close.assert_called_once()
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["events_scanned"] == 3
+
+
 class TestShareHelpers:
     def test_share_preview_json_returns_payload(self):
         payload = _share_preview([{"session_id": "s1", "display_title": "hello", "risk_badges": "[]"}], output_json=True)
